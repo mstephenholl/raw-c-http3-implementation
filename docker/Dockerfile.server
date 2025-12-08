@@ -1,0 +1,90 @@
+# HTTP/3 Server Dockerfile
+# Builds and runs the HTTP/3 server implementation (RFC 9114)
+
+FROM debian:bookworm-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    pkg-config \
+    git \
+    autoconf \
+    automake \
+    libtool \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build quictls (OpenSSL with QUIC support) - use version that works with ngtcp2 v1.2.0
+WORKDIR /tmp
+RUN git clone --depth 1 --branch openssl-3.1.5-quic1 https://github.com/quictls/openssl.git && \
+    cd openssl && \
+    ./Configure --prefix=/usr/local --openssldir=/usr/local/ssl --libdir=lib && \
+    make -j$(nproc) && \
+    make install_sw && \
+    ldconfig
+
+# Build ngtcp2 with quictls - v1.2.0 is known to work with curl
+# Force pkg-config to find our quictls and hide system OpenSSL
+RUN git clone --depth 1 --branch v1.2.0 https://github.com/ngtcp2/ngtcp2.git && \
+    cd ngtcp2 && \
+    autoreconf -fi && \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    LDFLAGS="-L/usr/local/lib -Wl,-rpath,/usr/local/lib" \
+    CFLAGS="-I/usr/local/include" \
+    ./configure --prefix=/usr/local --enable-lib-only --with-openssl && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig
+
+# Copy source code
+WORKDIR /app
+COPY CMakeLists.txt ./
+COPY include/ ./include/
+COPY src/ ./src/
+
+# Build HTTP/3 implementation
+RUN mkdir build && cd build && \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    cmake .. \
+        -DOPENSSL_ROOT_DIR=/usr/local \
+        -DOPENSSL_INCLUDE_DIR=/usr/local/include \
+        -DOPENSSL_CRYPTO_LIBRARY=/usr/local/lib/libcrypto.so \
+        -DOPENSSL_SSL_LIBRARY=/usr/local/lib/libssl.so && \
+    make -j$(nproc) VERBOSE=1
+
+# Runtime image
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    net-tools \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy built binaries and libraries
+COPY --from=builder /app/build/h3_server /usr/local/bin/
+COPY --from=builder /usr/local/lib/libngtcp2*.so* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libssl.so* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libcrypto.so* /usr/local/lib/
+RUN ldconfig
+
+# Create certs directory
+RUN mkdir -p /certs
+
+# Generate self-signed certificate
+RUN openssl req -x509 -newkey rsa:2048 -keyout /certs/server.key -out /certs/server.crt \
+    -days 365 -nodes -subj "/CN=http3-server" \
+    -addext "subjectAltName=DNS:http3-server,DNS:localhost,IP:127.0.0.1"
+
+# Expose UDP port
+EXPOSE 4433/udp
+
+# Set working directory
+WORKDIR /app
+
+# Run server
+ENTRYPOINT ["/usr/local/bin/h3_server"]
+CMD ["/certs/server.crt", "/certs/server.key", "4433"]

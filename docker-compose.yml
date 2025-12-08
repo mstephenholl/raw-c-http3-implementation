@@ -1,0 +1,53 @@
+services:
+  # HTTP/3 Server
+  http3-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    container_name: http3-server
+    hostname: http3-server
+    ports:
+      - "4433:4433/udp"
+    networks:
+      - http3-network
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -uln | grep -q ':4433' || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+      start_period: 5s
+
+  # HTTP/3 Client (for testing)
+  http3-client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    container_name: http3-client
+    depends_on:
+      http3-server:
+        condition: service_healthy
+    networks:
+      - http3-network
+    command: ["-p", "4433", "http3-server", "/"]
+
+  # Test runner service
+  http3-test:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    container_name: http3-test
+    depends_on:
+      http3-server:
+        condition: service_healthy
+    networks:
+      - http3-network
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/bash", "/scripts/test_http3.sh"]
+
+networks:
+  http3-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
