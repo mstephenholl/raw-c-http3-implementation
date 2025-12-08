@@ -82,12 +82,19 @@ static void signal_handler(int sig) {
 
 static uint64_t get_timestamp(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "clock_gettime failed: %s", strerror(errno));
+        return 0;
+    }
     return (uint64_t)ts.tv_sec * NGTCP2_SECONDS + (uint64_t)ts.tv_nsec;
 }
 
-static void rand_bytes(uint8_t *data, size_t len) {
-    RAND_bytes(data, (int)len);
+static int rand_bytes(uint8_t *data, size_t len) {
+    if (RAND_bytes(data, (int)len) != 1) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "RAND_bytes failed");
+        return -1;
+    }
+    return 0;
 }
 
 /* ngtcp2 callbacks */
@@ -269,7 +276,10 @@ static int client_stream_close(ngtcp2_conn *conn, uint32_t flags, int64_t stream
 
 static void client_rand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *rand_ctx) {
     (void)rand_ctx;
-    rand_bytes(dest, destlen);
+    /* Note: ngtcp2_rand callback has void return type, so we can only log on failure */
+    if (rand_bytes(dest, destlen) != 0) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "client_rand: failed to generate random bytes");
+    }
 }
 
 static int client_get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid,
@@ -277,9 +287,13 @@ static int client_get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid,
                                         void *user_data) {
     (void)conn;
     (void)user_data;
-    rand_bytes(cid->data, cidlen);
+    if (rand_bytes(cid->data, cidlen) != 0) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     cid->datalen = cidlen;
-    rand_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
+    if (rand_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN) != 0) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     return 0;
 }
 
@@ -287,7 +301,9 @@ static int client_get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid,
 static int client_get_path_challenge_data(ngtcp2_conn *conn, uint8_t *data, void *user_data) {
     (void)conn;
     (void)user_data;
-    rand_bytes(data, NGTCP2_PATH_CHALLENGE_DATALEN);
+    if (rand_bytes(data, NGTCP2_PATH_CHALLENGE_DATALEN) != 0) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     return 0;
 }
 
@@ -398,8 +414,12 @@ static int send_settings(client_ctx_t *ctx) {
                                                     ctx->control_stream_id, &control_vec, 1,
                                                     get_timestamp());
     if (pktlen > 0) {
-        sendto(ctx->fd, pktbuf, pktlen, 0,
-               (struct sockaddr *)&ctx->server_addr, ctx->server_addrlen);
+        ssize_t sent = sendto(ctx->fd, pktbuf, pktlen, 0,
+                              (struct sockaddr *)&ctx->server_addr, ctx->server_addrlen);
+        if (sent < 0) {
+            h3_log(LOG_LEVEL_ERROR, "CLIENT", "sendto() failed for control stream: %s", strerror(errno));
+            return -1;
+        }
         h3_log(LOG_LEVEL_DEBUG, "CLIENT", "[HTTP/3] Control stream data sent: %zu bytes", offset);
     }
 
@@ -415,8 +435,12 @@ static int send_settings(client_ctx_t *ctx) {
                                        ctx->qpack_encoder_stream_id, &enc_vec, 1,
                                        get_timestamp());
     if (pktlen > 0) {
-        sendto(ctx->fd, pktbuf, pktlen, 0,
-               (struct sockaddr *)&ctx->server_addr, ctx->server_addrlen);
+        ssize_t sent = sendto(ctx->fd, pktbuf, pktlen, 0,
+                              (struct sockaddr *)&ctx->server_addr, ctx->server_addrlen);
+        if (sent < 0) {
+            h3_log(LOG_LEVEL_ERROR, "CLIENT", "sendto() failed for QPACK encoder stream: %s", strerror(errno));
+            return -1;
+        }
     }
 
     /* Send QPACK decoder stream type */
@@ -431,8 +455,12 @@ static int send_settings(client_ctx_t *ctx) {
                                        ctx->qpack_decoder_stream_id, &dec_vec, 1,
                                        get_timestamp());
     if (pktlen > 0) {
-        sendto(ctx->fd, pktbuf, pktlen, 0,
-               (struct sockaddr *)&ctx->server_addr, ctx->server_addrlen);
+        ssize_t sent = sendto(ctx->fd, pktbuf, pktlen, 0,
+                              (struct sockaddr *)&ctx->server_addr, ctx->server_addrlen);
+        if (sent < 0) {
+            h3_log(LOG_LEVEL_ERROR, "CLIENT", "sendto() failed for QPACK decoder stream: %s", strerror(errno));
+            return -1;
+        }
     }
 
     ctx->settings_sent = true;
@@ -538,6 +566,7 @@ static int resolve_host(const char *host, int port, struct sockaddr_storage *add
 }
 
 static int create_client_socket(struct sockaddr_storage *addr, socklen_t addrlen) {
+    (void)addrlen;
     int fd = socket(addr->ss_family, SOCK_DGRAM, 0);
     if (fd < 0) {
         h3_log(LOG_LEVEL_ERROR, "CLIENT", "socket() failed: %s", strerror(errno));
@@ -546,7 +575,16 @@ static int create_client_socket(struct sockaddr_storage *addr, socklen_t addrlen
 
     /* Set non-blocking */
     int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "fcntl(F_GETFL) failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "fcntl(F_SETFL) failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
 
     return fd;
 }
@@ -680,9 +718,15 @@ int main(int argc, char **argv) {
 
     /* Generate connection IDs */
     ngtcp2_cid scid, dcid;
-    rand_bytes(scid.data, NGTCP2_MAX_CIDLEN);
+    if (rand_bytes(scid.data, NGTCP2_MAX_CIDLEN) != 0) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "Failed to generate source connection ID");
+        return 1;
+    }
     scid.datalen = NGTCP2_MAX_CIDLEN;
-    rand_bytes(dcid.data, NGTCP2_MAX_CIDLEN);
+    if (rand_bytes(dcid.data, NGTCP2_MAX_CIDLEN) != 0) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "Failed to generate destination connection ID");
+        return 1;
+    }
     dcid.datalen = NGTCP2_MAX_CIDLEN;
 
     /* Get local address */
@@ -694,8 +738,14 @@ int main(int argc, char **argv) {
     local_bind.sin_family = AF_INET;
     local_bind.sin_addr.s_addr = INADDR_ANY;
     local_bind.sin_port = 0;
-    bind(ctx.fd, (struct sockaddr *)&local_bind, sizeof(local_bind));
-    getsockname(ctx.fd, (struct sockaddr *)&local_addr, &local_addrlen);
+    if (bind(ctx.fd, (struct sockaddr *)&local_bind, sizeof(local_bind)) < 0) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "bind() failed: %s", strerror(errno));
+        return 1;
+    }
+    if (getsockname(ctx.fd, (struct sockaddr *)&local_addr, &local_addrlen) < 0) {
+        h3_log(LOG_LEVEL_ERROR, "CLIENT", "getsockname() failed: %s", strerror(errno));
+        return 1;
+    }
 
     ngtcp2_path path_obj = {
         .local = { .addr = (struct sockaddr *)&local_addr, .addrlen = local_addrlen },
@@ -786,12 +836,21 @@ int main(int argc, char **argv) {
 
         /* After handshake, open streams and send request */
         if (ctx.handshake_completed && !ctx.control_stream_opened) {
-            open_client_streams(&ctx);
-            send_settings(&ctx);
+            if (open_client_streams(&ctx) != 0) {
+                h3_log(LOG_LEVEL_ERROR, "CLIENT", "Failed to open client streams");
+                break;
+            }
+            if (send_settings(&ctx) != 0) {
+                h3_log(LOG_LEVEL_ERROR, "CLIENT", "Failed to send settings");
+                break;
+            }
         }
 
         if (ctx.handshake_completed && ctx.control_stream_opened && !ctx.request_sent) {
-            send_request(&ctx);
+            if (send_request(&ctx) != 0) {
+                h3_log(LOG_LEVEL_ERROR, "CLIENT", "Failed to send request");
+                break;
+            }
         }
 
         /* Wait for incoming data */
