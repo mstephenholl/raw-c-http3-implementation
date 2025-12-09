@@ -237,6 +237,9 @@ run_local_tests() {
 
     echo "Server started (PID: $SERVER_PID)"
 
+    # Give server time to reset after the ready check connection
+    sleep 1
+
     # Run tests
     run_protocol_tests "$BUILD_DIR/h3_client"
 }
@@ -269,11 +272,28 @@ run_docker_tests() {
     echo ""
 
     # Run with timeout and capture exit code
+    # Use gtimeout on macOS (from coreutils) or timeout on Linux
+    local timeout_cmd="timeout"
+    if [[ "$(uname)" == "Darwin" ]] && command -v gtimeout &> /dev/null; then
+        timeout_cmd="gtimeout"
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        # No timeout available on macOS, run without it
+        timeout_cmd=""
+    fi
+
     local exit_code=0
-    if timeout 120 docker compose up http3-test --abort-on-container-exit 2>&1; then
-        exit_code=0
+    if [ -n "$timeout_cmd" ]; then
+        if $timeout_cmd 120 docker compose up http3-test --abort-on-container-exit 2>&1; then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
     else
-        exit_code=$?
+        if docker compose up http3-test --abort-on-container-exit 2>&1; then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
     fi
 
     # Show summary based on test container output
@@ -297,6 +317,46 @@ run_docker_tests() {
     docker compose down 2>/dev/null || true
 
     return $exit_code
+}
+
+# ============================================
+# DOCKER INNER MODE (runs inside container)
+# ============================================
+run_docker_inner_tests() {
+    echo ""
+    echo "=============================================="
+    echo -e "${BLUE}HTTP/3 Docker Test Suite${NC}"
+    echo "=============================================="
+    echo ""
+    echo "Configuration:"
+    echo "  Mode: Docker (inner)"
+    echo "  Server: ${SERVER_HOST}:${SERVER_PORT}"
+    echo ""
+
+    # Wait for server to be ready
+    echo -e "${YELLOW}Waiting for HTTP/3 server to be ready...${NC}"
+    local retry=0
+    while [ $retry -lt $MAX_RETRIES ]; do
+        if /usr/local/bin/h3_client -p "$SERVER_PORT" "$SERVER_HOST" "/" 2>&1 | grep -q "HTTP/3"; then
+            echo -e "${GREEN}Server is ready!${NC}"
+            break
+        fi
+
+        retry=$((retry + 1))
+        echo "  Attempt $retry/$MAX_RETRIES - waiting ${RETRY_DELAY}s..."
+        sleep $RETRY_DELAY
+    done
+
+    if [ $retry -eq $MAX_RETRIES ]; then
+        echo -e "${RED}Server did not become ready in time${NC}"
+        exit 1
+    fi
+
+    # Give server time to reset after the ready check connection
+    sleep 1
+
+    # Run tests using the installed client binary
+    run_protocol_tests "/usr/local/bin/h3_client"
 }
 
 # ============================================
@@ -326,6 +386,12 @@ main() {
             ;;
         docker)
             run_docker_tests
+            ;;
+        docker-inner)
+            # Called from inside Docker container - run tests against server
+            # Force http3-server as the host (override the default localhost)
+            SERVER_HOST="http3-server"
+            run_docker_inner_tests
             ;;
         *)
             echo "Usage: $0 [local|docker|auto]"

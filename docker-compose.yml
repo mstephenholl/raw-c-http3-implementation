@@ -43,7 +43,7 @@ services:
       - http3-network
     volumes:
       - ./scripts:/scripts:ro
-    entrypoint: ["/bin/bash", "/scripts/test_http3.sh"]
+    entrypoint: ["/bin/bash", "/scripts/test-http3.sh", "docker-inner"]
 
 networks:
   http3-network:
