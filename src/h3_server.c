@@ -50,6 +50,10 @@ typedef struct {
     socklen_t client_addrlen;
     ngtcp2_crypto_conn_ref conn_ref;
 
+    /* Store client's SCID to identify the same connection during handshake */
+    ngtcp2_cid client_scid;
+    bool client_scid_valid;
+
     /* HTTP/3 state */
     h3_settings_t settings;
     int64_t control_stream_id;
@@ -604,11 +608,61 @@ int main(int argc, char **argv) {
 
             h3_log(LOG_LEVEL_DEBUG, "SERVER", "[QUIC] Received %zd bytes", nread);
 
+            /* Check if existing connection is in draining state - if so, clean it up */
+            if (ctx.conn && ngtcp2_conn_in_draining_period(ctx.conn)) {
+                h3_log(LOG_LEVEL_INFO, "SERVER", "[QUIC] Connection in draining period, cleaning up");
+                ngtcp2_conn_del(ctx.conn);
+                ctx.conn = NULL;
+                if (ctx.ssl) {
+                    SSL_free(ctx.ssl);
+                    ctx.ssl = NULL;
+                }
+                /* Reset HTTP/3 state */
+                ctx.control_stream_opened = false;
+                ctx.settings_sent = false;
+                ctx.settings_received = false;
+                ctx.control_stream_id = -1;
+                ctx.client_scid_valid = false;
+                h3_log(LOG_LEVEL_INFO, "SERVER", "[QUIC] Ready to accept new connections");
+            }
+
+            /* Check if this is an Initial packet */
+            ngtcp2_pkt_hd hd;
+            int is_initial = (ngtcp2_accept(&hd, buf, nread) >= 0);
+
+            /* If we have an existing connection and receive an Initial packet,
+             * check if it's for a different connection (new client).
+             *
+             * IMPORTANT: During handshake, the client sends Initial packets with:
+             *   - hd.dcid: A random DCID the client generated (becomes server's SCID)
+             *   - hd.scid: The client's own SCID (how the client identifies itself)
+             *
+             * We compare the incoming packet's SCID (hd.scid) with the stored client SCID
+             * to determine if this is a retransmission from the same client or a new client.
+             */
+            if (ctx.conn && is_initial && ctx.client_scid_valid) {
+                /* If the incoming packet's SCID doesn't match our stored client SCID, it's a new client */
+                if (hd.scid.datalen != ctx.client_scid.datalen ||
+                    memcmp(hd.scid.data, ctx.client_scid.data, ctx.client_scid.datalen) != 0) {
+                    h3_log(LOG_LEVEL_INFO, "SERVER", "[QUIC] New client connection detected (different client SCID), closing old connection");
+                    ngtcp2_conn_del(ctx.conn);
+                    ctx.conn = NULL;
+                    if (ctx.ssl) {
+                        SSL_free(ctx.ssl);
+                        ctx.ssl = NULL;
+                    }
+                    /* Reset HTTP/3 state */
+                    ctx.control_stream_opened = false;
+                    ctx.settings_sent = false;
+                    ctx.settings_received = false;
+                    ctx.control_stream_id = -1;
+                    ctx.client_scid_valid = false;
+                }
+            }
+
             /* If no connection exists, try to accept a new one */
             if (!ctx.conn) {
-                ngtcp2_pkt_hd hd;
-                int rv = ngtcp2_accept(&hd, buf, nread);
-                if (rv < 0) {
+                if (!is_initial) {
                     h3_log(LOG_LEVEL_DEBUG, "SERVER", "Not an Initial packet, ignoring");
                     continue;
                 }
@@ -687,7 +741,7 @@ int main(int argc, char **argv) {
                  *   dcid: Client's SCID from Initial packet (what client wants to be called)
                  *   scid: Server's chosen SCID
                  * And params.original_dcid = Client's DCID from Initial packet */
-                rv = ngtcp2_conn_server_new(&ctx.conn, &hd.scid, &scid, &path,
+                int rv = ngtcp2_conn_server_new(&ctx.conn, &hd.scid, &scid, &path,
                                             hd.version, &callbacks, &settings,
                                             &params, NULL, &ctx);
                 if (rv != 0) {
@@ -699,6 +753,10 @@ int main(int argc, char **argv) {
 
                 /* Link the TLS native handle to the ngtcp2 connection */
                 ngtcp2_conn_set_tls_native_handle(ctx.conn, ctx.ssl);
+
+                /* Store the client's SCID so we can identify this client for future packets */
+                ctx.client_scid = hd.scid;
+                ctx.client_scid_valid = true;
 
                 /* Note: ngtcp2_crypto_quictls_configure_server_context sets up the callbacks
                  * that handle transport params automatically through the conn_ref mechanism.
@@ -742,7 +800,24 @@ int main(int argc, char **argv) {
             h3_log(LOG_LEVEL_DEBUG, "SERVER", "[QUIC] ngtcp2_conn_read_pkt returned %d", rv);
             if (rv != 0) {
                 if (rv == NGTCP2_ERR_DRAINING || rv == NGTCP2_ERR_CLOSING) {
-                    h3_log(LOG_LEVEL_INFO, "SERVER", "[QUIC] Connection closing/draining");
+                    h3_log(LOG_LEVEL_INFO, "SERVER", "[QUIC] Connection closing/draining, cleaning up");
+                    /* Clean up connection to allow accepting new ones */
+                    if (ctx.conn) {
+                        ngtcp2_conn_del(ctx.conn);
+                        ctx.conn = NULL;
+                    }
+                    if (ctx.ssl) {
+                        SSL_free(ctx.ssl);
+                        ctx.ssl = NULL;
+                    }
+                    /* Reset HTTP/3 state */
+                    ctx.control_stream_opened = false;
+                    ctx.settings_sent = false;
+                    ctx.settings_received = false;
+                    ctx.control_stream_id = -1;
+                    ctx.client_scid_valid = false;
+                    h3_log(LOG_LEVEL_INFO, "SERVER", "[QUIC] Ready to accept new connections");
+                    continue;
                 } else {
                     h3_log(LOG_LEVEL_ERROR, "SERVER", "[QUIC] ngtcp2_conn_read_pkt failed: %s (%d)",
                            ngtcp2_strerror(rv), rv);
