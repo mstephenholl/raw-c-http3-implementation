@@ -2,6 +2,33 @@
 
 A complete HTTP/3 (RFC 9114) implementation in C, featuring both client and server components built on the QUIC transport protocol.
 
+## Quick Start
+
+### Using Docker (Easiest)
+
+```bash
+# Clone and run tests
+git clone <repository-url>
+cd http3-implementation
+./scripts/test-http3.sh docker
+```
+
+### Local Build (macOS/Linux)
+
+```bash
+# Install dependencies
+./scripts/install-deps-macos.sh  # or install-deps-linux.sh
+
+# Add to your shell profile (then restart terminal or source it):
+export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+export DYLD_LIBRARY_PATH="$HOME/.local/lib:$DYLD_LIBRARY_PATH"  # macOS
+export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"      # Linux
+
+# Build and test
+./scripts/build-local.sh
+./scripts/test-http3.sh
+```
+
 ## Overview
 
 This project implements the HTTP/3 protocol as specified in [RFC 9114](https://datatracker.ietf.org/doc/html/rfc9114), using:
@@ -34,14 +61,11 @@ http3-implementation/
 │   ├── Dockerfile.server    # Server container build
 │   └── Dockerfile.client    # Client container build
 ├── scripts/
-│   ├── test_http3.sh        # Test script for verification
+│   ├── test-http3.sh        # Unified test script (local/docker/auto)
 │   ├── install-deps-macos.sh # Install dependencies on macOS
 │   ├── install-deps-linux.sh # Install dependencies on Linux
 │   ├── build-local.sh       # Build project locally
-│   ├── run-local-test.sh    # Run tests locally
-│   ├── validate-docker.sh   # Validate with Docker
-│   ├── show-debug-logs.sh   # Show RFC 9114 debug output
-│   └── setup-ide.sh         # Setup IDE support
+│   └── show-debug-logs.sh   # Show RFC 9114 debug output
 ├── certs/                   # TLS certificates (generated)
 ├── CMakeLists.txt           # CMake build configuration
 ├── docker-compose.yml       # Docker orchestration
@@ -150,7 +174,22 @@ sudo make install
 
 ## Running
 
-### Using Docker Compose (Recommended)
+### Using the Test Script (Recommended)
+
+The unified test script handles both local and Docker testing:
+
+```bash
+# Auto-detect mode (uses local binaries if available, else Docker)
+./scripts/test-http3.sh
+
+# Force local mode
+./scripts/test-http3.sh local
+
+# Force Docker mode
+./scripts/test-http3.sh docker
+```
+
+### Using Docker Compose
 
 #### Run the Complete Test Suite
 
@@ -178,21 +217,6 @@ docker compose run --rm http3-client -p 4433 http3-server /
 # Run client with different parameters
 docker compose run --rm http3-client -p 4433 http3-server /api/test
 ```
-
-### Local Test (Without Docker)
-
-The easiest way to run local tests is with the provided script:
-
-```bash
-# Run automated test (starts server, runs client, reports results)
-./scripts/run-local-test.sh
-```
-
-This script will:
-1. Generate self-signed TLS certificates (if needed)
-2. Start the HTTP/3 server
-3. Run the client test
-4. Report pass/fail status
 
 ### Manual Native Execution
 
@@ -233,21 +257,19 @@ openssl req -x509 -newkey rsa:2048 \
 
 ## Testing
 
-### Automated Test Suite
+### Unified Test Script
 
-The project includes a comprehensive test script that verifies HTTP/3 communication:
+The project includes a unified test script that supports multiple modes:
 
 ```bash
-# Run full test suite with Docker (recommended for CI)
-./scripts/validate-docker.sh
+# Auto-detect: uses local binaries if available, otherwise Docker
+./scripts/test-http3.sh
 
-# Or run individual Docker commands
-docker compose up http3-test
-docker compose up -d http3-server
-docker compose run --rm http3-test
+# Force local mode (requires build-local.sh first)
+./scripts/test-http3.sh local
 
-# Run tests locally (without Docker)
-./scripts/run-local-test.sh
+# Force Docker mode (builds and runs in containers)
+./scripts/test-http3.sh docker
 
 # View RFC 9114 debug output (frame dumps, settings)
 ./scripts/show-debug-logs.sh
@@ -266,30 +288,37 @@ The test suite verifies:
 
 ```
 ==============================================
-HTTP/3 Communication Test Suite
+HTTP/3 Local Test Suite
 ==============================================
 
 Configuration:
-  Server: http3-server:4433
-  Test Path: /
-  Max Retries: 5
+  Mode: Local
+  Server: localhost:4433
+  Build Dir: /path/to/http3-implementation/build
 
-Waiting for HTTP/3 server to be ready...
+Starting HTTP/3 server on port 4433...
+Waiting for server to be ready...
 Server is ready!
+Server started (PID: 12345)
 
 ==============================================
 Running HTTP/3 Protocol Tests
 ==============================================
 
 Running: Basic GET Request (root path)
-  Request: GET https://http3-server:4433/
+  Request: GET https://localhost:4433/
 [PASS] Basic GET Request (root path)
 
 Running: GET Request (index.html)
-  Request: GET https://http3-server:4433/index.html
+  Request: GET https://localhost:4433/index.html
 [PASS] GET Request (index.html)
 
-...
+Running: GET Request (with query)
+  Request: GET https://localhost:4433/test?param=value
+[PASS] GET Request (with query)
+
+Running: Multiple Sequential Requests
+[PASS] Multiple Sequential Requests (3/3 successful)
 
 ==============================================
 Test Summary
@@ -391,6 +420,13 @@ Protocol verification:
    - Update Docker and Docker Compose to latest versions
    - Check internet connectivity for package downloads
 
+4. **Library Not Found (macOS)**
+   - Ensure environment variables are set:
+     ```bash
+     export DYLD_LIBRARY_PATH="$HOME/.local/lib:$DYLD_LIBRARY_PATH"
+     ```
+   - Restart your terminal after setting environment variables
+
 ### Debug Mode
 
 The implementation includes RFC 9114 debug logging that shows:
@@ -419,10 +455,11 @@ h3_set_log_level(LOG_LEVEL_DEBUG);
 
 ### IDE Setup
 
-Generate `compile_commands.json` for IDE support (VSCode, CLion, etc.):
+The build script automatically generates `compile_commands.json` for IDE support (VSCode, CLion, etc.):
 
 ```bash
-./scripts/setup-ide.sh
+./scripts/build-local.sh
+# compile_commands.json is copied to project root
 ```
 
 ## RFC Compliance
@@ -440,10 +477,6 @@ This implementation follows these specifications:
 - Single connection handling (not production-ready)
 - Server push not fully implemented
 - No connection migration support
-
-## License
-
-This project is provided for educational purposes. See individual source files for licensing details.
 
 ## References
 
